@@ -1,6 +1,6 @@
 # CliMate iOS
 
-This folder contains a minimal SwiftUI client that connects to `codex app-server` over WebSocket.
+This folder contains a minimal SwiftUI client that connects to the CliMate server over HTTP JSON-RPC + SSE.
 
 The iOS app is generated via XcodeGen (so we don't commit a large `.pbxproj`).
 

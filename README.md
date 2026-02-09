@@ -2,35 +2,36 @@
 
 MVP: run `codex app-server` on macOS and connect from iPhone over Tailscale.
 
-## macOS (server)
+## Server (Go, embedded tailnet) — current
 
 Prereqs:
 
 - `codex` installed and able to run `codex app-server`
-- Tailscale installed and logged in on the Mac (to publish the port via Serve)
 - Tailnet access control allows your iPhone device/user to reach this Mac on the chosen port
+- Go installed + a Tailscale auth key (`TS_AUTHKEY=tskey-...`)
 
 Run:
 
 ```bash
-cargo run -- up --port 4500
+cd server
+TS_AUTHKEY=tskey-auth-... go run ./cmd/climate-server --port 4500 --ts-hostname climate-mac
 ```
 
-This starts:
-
-- an HTTP bridge on `http://127.0.0.1:4500` that spawns `codex app-server` (stdio transport) and exposes:
-  - `POST /rpc` for JSON-RPC messages
-  - `GET /events` for SSE stream of JSON-RPC messages
-- `tailscale serve --tcp 4500 tcp://127.0.0.1:4500 --bg` (tailnet-only)
-
-Stop with Ctrl+C (CliMate will attempt to turn Serve off for that port).
-
-If you need to find the connect address manually:
+Optional build:
 
 ```bash
-tailscale status
-tailscale serve status
+cd server
+go build -o climate-server ./cmd/climate-server
+./climate-server --port 4500 --ts-auth-key tskey-auth-... --ts-hostname climate-mac
 ```
+
+This starts an HTTP bridge on `http://127.0.0.1:4500` that spawns `codex app-server`
+(stdio transport) and exposes:
+
+- `POST /rpc` for JSON-RPC messages
+- `GET /events` for SSE stream of JSON-RPC messages
+
+The server prints the iOS base URL (MagicDNS) when available.
 
 ## iOS (client)
 
@@ -40,5 +41,8 @@ See `ios/README.md`.
 
 - `codex app-server` WebSocket transport is documented as experimental/unsupported.
 - iOS ATS often blocks `http://`; this MVP uses an ATS override in `ios/CliMateApp/Resources/Info.plist`.
-- `tailscale serve --bg` persists until disabled (see `tailscale serve ... off`).
-- Keep `codex app-server` bound to loopback and publish only via Tailscale Serve (prevents LAN exposure).
+
+## Legacy Rust server (deprecated)
+
+The previous Rust implementation lives in `legacy/rust-server` for reference.
+It is not maintained and will be removed once the Go server fully replaces it.
