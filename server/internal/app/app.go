@@ -123,6 +123,7 @@ func normalizeConfig(cfg Config) Config {
 	if strings.TrimSpace(cfg.TSStateDir) == "" {
 		cfg.TSStateDir = defaultStateDir()
 	}
+	cfg.TSStateDir = expandHomeDir(cfg.TSStateDir)
 	return cfg
 }
 
@@ -132,4 +133,22 @@ func defaultStateDir() string {
 		return filepath.Join(".climate", "tsnet")
 	}
 	return filepath.Join(home, ".climate", "tsnet")
+}
+
+func expandHomeDir(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return path
+	}
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil || home == "" {
+			return path
+		}
+		if path == "~" {
+			return home
+		}
+		return filepath.Join(home, strings.TrimPrefix(path, "~/"))
+	}
+	return path
 }

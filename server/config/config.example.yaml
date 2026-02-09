@@ -1,0 +1,6 @@
+codex_bin: codex
+bind_ip: 127.0.0.1
+port: 4500
+ts_auth_key: tskey-auth-REPLACE_ME
+ts_hostname: climate-mac
+ts_state_dir: ~/.climate/tsnet

@@ -8,13 +8,15 @@ Prereqs:
 
 - `codex` installed and able to run `codex app-server`
 - Tailnet access control allows your iPhone device/user to reach this Mac on the chosen port
-- Go installed + a Tailscale auth key (`TS_AUTHKEY=tskey-...`)
+- Go installed + a Tailscale auth key (`tskey-...`)
 
-Run:
+Run (config file):
 
 ```bash
 cd server
-TS_AUTHKEY=tskey-auth-... go run ./cmd/climate-server --port 4500 --ts-hostname climate-mac
+cp config/config.example.yaml config/config.yaml
+# edit ts_auth_key / ts_hostname / port as needed
+go run ./cmd/climate-server
 ```
 
 Optional build:
@@ -33,6 +35,30 @@ This starts an HTTP bridge on `http://127.0.0.1:4500` that spawns `codex app-ser
 
 The server prints the iOS base URL (MagicDNS) when available.
 
+### Config (optional)
+
+Supported sources (in order of precedence):
+
+1. CLI flags
+2. YAML config file
+
+Default config path:
+
+- `server/config/config.yaml` (repo root)
+- `config/config.yaml` (when running inside `server/`)
+
+You can override with:
+
+```bash
+go run ./cmd/climate-server --config /path/to/config.yaml
+```
+
+Example config:
+
+```bash
+cp server/config/config.example.yaml server/config/config.yaml
+```
+
 ## iOS (client)
 
 See `ios/README.md`.
@@ -41,8 +67,3 @@ See `ios/README.md`.
 
 - `codex app-server` WebSocket transport is documented as experimental/unsupported.
 - iOS ATS often blocks `http://`; this MVP uses an ATS override in `ios/CliMateApp/Resources/Info.plist`.
-
-## Legacy Rust server (deprecated)
-
-The previous Rust implementation lives in `legacy/rust-server` for reference.
-It is not maintained and will be removed once the Go server fully replaces it.

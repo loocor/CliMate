@@ -17,13 +17,13 @@ ios/CliMateApp/Vendor/
 # Build output
 ios/CliMateApp/build/
 
-# tsnet-proxy build output (legacy)
-legacy/tsnet-proxy/tsnet-proxy
-legacy/tsnet-proxy/tsnet-proxy.exe
-
-# Rust build output (legacy)
-legacy/rust-server/target/
 
 # Go server build output
 server/climate-go
 server/climate-go.exe
+
+# Local config
+server/config/config.yaml
+server/config/config.yml
+server/config/climate.yaml
+server/config/climate.yml
