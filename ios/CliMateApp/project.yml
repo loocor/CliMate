@@ -1,0 +1,22 @@
+name: CliMate
+
+options:
+  bundleIdPrefix: ai.umate.climate
+
+settings:
+  base:
+    SWIFT_VERSION: 5.0
+
+targets:
+  CliMate:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Sources
+    resources:
+      - path: Resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.umate.climate.ios
+        INFOPLIST_FILE: Resources/Info.plist
