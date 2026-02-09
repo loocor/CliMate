@@ -10,3 +10,9 @@ xcuserdata/
 # Generated projects
 *.xcodeproj/
 *.xcworkspace/
+
+# Embedded TailscaleKit build artifacts
+ios/CliMateApp/Vendor/
+
+# Build output
+ios/CliMateApp/build/

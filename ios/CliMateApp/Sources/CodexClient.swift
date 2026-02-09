@@ -21,21 +21,38 @@ final class CodexClient: ObservableObject {
 
     private(set) var lastURL: String? = nil
 
-    private var webSocketTask: URLSessionWebSocketTask?
-    private var receiveTask: Task<Void, Never>?
+    private var eventsTask: Task<Void, Never>?
+
+    private var baseURL: URL?
+    private var httpClient: SOCKS5HTTPClient?
 
     private var nextId: Int = 0
     private var pendingResponses: [Int: CheckedContinuation<[String: Any], Error>] = [:]
 
     private var threadId: String?
 
-    func connect(urlString: String) {
+    func connect(urlString: String, authKey: String) {
         if connectionState != .disconnected {
             return
         }
 
-        guard let url = URL(string: urlString) else {
+        guard let baseURL = URL(string: urlString) else {
             lastError = "Invalid URL"
+            return
+        }
+        if baseURL.scheme?.lowercased() != "http" {
+            lastError = "Only http:// is supported (server is HTTP + SSE)."
+            return
+        }
+        guard let host = baseURL.host else {
+            lastError = "Invalid URL (missing host)"
+            return
+        }
+        let port = baseURL.port ?? 80
+
+        let trimmedAuthKey = authKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedAuthKey.isEmpty {
+            lastError = "Missing Tailscale auth key"
             return
         }
 
@@ -43,37 +60,66 @@ final class CodexClient: ObservableObject {
         connectionState = .connecting
         transcript = ""
         threadId = nil
+        self.baseURL = baseURL
 
-        let session = URLSession(configuration: .default)
-        let task = session.webSocketTask(with: url)
-        webSocketTask = task
-        task.resume()
-
-        receiveTask = Task { [weak self] in
-            await self?.receiveLoop()
-        }
+        log("connect baseURL=\(baseURL.absoluteString)")
 
         Task {
             do {
-                try await initializeHandshake()
-                try await startThread()
-                appendLine("[connected]")
-                connectionState = .connected
+                let proxy = try await EmbeddedTailscale.shared.proxyConfig(authKey: trimmedAuthKey)
+                self.appendLine("[tailscale] proxy \(proxy.debugDescription)")
+                self.appendLine("[tailscale] target http://\(host):\(port)")
+
+                do {
+                    let client = try SOCKS5HTTPClient(
+                        proxy: proxy,
+                        target: .init(host: host, port: port)
+                    )
+                    self.httpClient = client
+
+                    try await self.preflightHealthz()
+                    self.log("healthz ok")
+                } catch {
+                    self.log("healthz failed: \(error)")
+                    throw error
+                }
+
+                self.log("starting SSE /events")
+
+                self.eventsTask = Task { [weak self] in
+                    await self?.eventsLoop()
+                }
+
+                do {
+                    try await self.initializeHandshake()
+                    try await self.startThread()
+                    self.appendLine("[connected]")
+                    self.connectionState = .connected
+                    self.log("connected")
+                } catch {
+                    self.log("connect failed: \(error)")
+                    self.lastError = Self.describe(error)
+                    self.disconnect()
+                }
             } catch {
-                lastError = error.localizedDescription
-                disconnect()
+                self.log("tailscale init failed: \(error)")
+                self.lastError = Self.describe(error)
+                self.disconnect()
             }
         }
     }
 
-    func disconnect() {
-        receiveTask?.cancel()
-        receiveTask = nil
+    private func preflightHealthz() async throws {
+        guard let client = httpClient else { throw ClientError.notConnected }
+        _ = try await client.get(path: "/healthz")
+    }
 
-        if let task = webSocketTask {
-            task.cancel(with: .goingAway, reason: nil)
-        }
-        webSocketTask = nil
+    func disconnect() {
+        log("disconnect")
+        eventsTask?.cancel()
+        eventsTask = nil
+        baseURL = nil
+        httpClient = nil
 
         pendingResponses.removeAll()
         pendingApproval = nil
@@ -87,6 +133,8 @@ final class CodexClient: ObservableObject {
             lastError = "No threadId (not ready yet)"
             return
         }
+
+        log("send turn/start")
 
         appendLine("\n> \(text)")
 
@@ -107,7 +155,8 @@ final class CodexClient: ObservableObject {
             do {
                 _ = try await request(method: "turn/start", params: params)
             } catch {
-                lastError = error.localizedDescription
+                self.log("turn/start failed: \(error)")
+                lastError = Self.describe(error)
             }
         }
     }
@@ -119,10 +168,10 @@ final class CodexClient: ObservableObject {
         Task {
             do {
                 let result: [String: Any] = ["decision": decision]
-                try await send(["id": approvalId, "result": result])
+                _ = try await postRPC(["id": approvalId, "result": result])
                 appendLine("[approval: \(approval.method) -> \(decision)]")
             } catch {
-                lastError = error.localizedDescription
+                lastError = Self.describe(error)
             }
         }
     }
@@ -139,7 +188,7 @@ final class CodexClient: ObservableObject {
         ]
 
         _ = try await request(method: "initialize", params: params)
-        try await send(["method": "initialized", "params": [:]])
+        _ = try await postRPC(["method": "initialized", "params": [:]])
     }
 
     private func startThread() async throws {
@@ -157,6 +206,8 @@ final class CodexClient: ObservableObject {
         let id = nextId
         nextId += 1
 
+        log("rpc -> \(method) id=\(id)")
+
         let payload: [String: Any] = [
             "method": method,
             "id": id,
@@ -167,7 +218,7 @@ final class CodexClient: ObservableObject {
             pendingResponses[id] = cont
             Task {
                 do {
-                    try await send(payload)
+                    _ = try await postRPC(payload)
                 } catch {
                     pendingResponses.removeValue(forKey: id)
                     cont.resume(throwing: error)
@@ -176,42 +227,74 @@ final class CodexClient: ObservableObject {
         }
     }
 
-    private func send(_ object: [String: Any]) async throws {
-        guard let webSocketTask else {
+    private func postRPC(_ object: [String: Any]) async throws -> [String: Any] {
+        guard let client = httpClient else {
             throw ClientError.notConnected
         }
 
-        let data = try JSONSerialization.data(withJSONObject: object, options: [])
-        guard let text = String(data: data, encoding: .utf8) else {
-            throw ClientError.serializationFailed
+        let body = try JSONSerialization.data(withJSONObject: object, options: [])
+        let data = try await client.postJSON(path: "/rpc", jsonBody: body)
+        let json = try JSONSerialization.jsonObject(with: data, options: [])
+        guard let obj = json as? [String: Any] else {
+            throw ClientError.unexpectedResponse("rpc response was not an object")
         }
-        try await webSocketTask.send(.string(text))
+        if let id = parseId(obj["id"]) {
+            handleResponse(id: id, result: obj["result"], error: obj["error"])
+        }
+        return obj
     }
 
-    private func receiveLoop() async {
-        guard let webSocketTask else { return }
+    private func eventsLoop() async {
+        do {
+            guard let client = httpClient else { return }
+            var currentData: String?
+            let stream = await client.sse(path: "/events")
+            for try await line in stream {
+                if Task.isCancelled { break }
 
-        while !Task.isCancelled {
-            do {
-                let message = try await webSocketTask.receive()
-                switch message {
-                case .string(let text):
-                    handleIncoming(text: text)
-                case .data(let data):
-                    if let text = String(data: data, encoding: .utf8) {
-                        handleIncoming(text: text)
+                if line.isEmpty {
+                    if let data = currentData {
+                        handleIncoming(text: data)
                     }
-                @unknown default:
-                    break
+                    currentData = nil
+                    continue
                 }
-            } catch {
-                if connectionState == .connected || connectionState == .connecting {
-                    lastError = error.localizedDescription
+
+                if line.hasPrefix(":") {
+                    // SSE comment/keepalive.
+                    continue
                 }
-                disconnect()
-                return
+
+                if line.hasPrefix("data:") {
+                    let value = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+                    currentData = value
+                }
             }
+
+            log("SSE ended")
+        } catch {
+            log("SSE failed: \(error)")
+            if connectionState == .connected || connectionState == .connecting {
+                lastError = Self.describe(error)
+            }
+            disconnect()
         }
+    }
+
+    private func log(_ message: String) {
+        NSLog("[climate] %@", message)
+    }
+
+    private static func describe(_ error: Error) -> String {
+        let ns = error as NSError
+        var parts: [String] = []
+        parts.append(error.localizedDescription)
+        parts.append("(\(ns.domain) \(ns.code))")
+
+        if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
+            parts.append("underlying: \(underlying.domain) \(underlying.code)")
+        }
+        return parts.joined(separator: " ")
     }
 
     private func handleIncoming(text: String) {
@@ -285,7 +368,7 @@ final class CodexClient: ObservableObject {
 
         Task {
             do {
-                try await send([
+                _ = try await postRPC([
                     "id": id,
                     "error": [
                         "code": -32601,
@@ -352,7 +435,9 @@ final class CodexClient: ObservableObject {
 
 enum ClientError: LocalizedError {
     case notConnected
+    case invalidBaseURL
     case serializationFailed
+    case httpError(Int, String)
     case remoteError(String)
     case unexpectedResponse(String)
 
@@ -360,8 +445,12 @@ enum ClientError: LocalizedError {
         switch self {
         case .notConnected:
             "Not connected"
+        case .invalidBaseURL:
+            "Invalid base URL"
         case .serializationFailed:
             "Failed to serialize message"
+        case .httpError(let code, let body):
+            "HTTP \(code): \(body)"
         case .remoteError(let message):
             "Server error: \(message)"
         case .unexpectedResponse(let detail):

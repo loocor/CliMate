@@ -16,6 +16,10 @@ targets:
       - path: Sources
     resources:
       - path: Resources
+    dependencies:
+      - framework: Vendor/TailscaleKit.xcframework
+        embed: true
+        codeSign: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.umate.climate.ios

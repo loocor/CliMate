@@ -4,12 +4,13 @@ struct TerminalView: View {
     @StateObject private var client = CodexClient()
 
     @State private var urlText: String = ""
+    @State private var authKeyText: String = ""
     @State private var inputText: String = ""
 
     var body: some View {
         VStack(spacing: 12) {
             HStack(spacing: 8) {
-                TextField("ws://<mac>.<tailnet>.ts.net:4500", text: $urlText)
+                TextField("http://100.x.y.z:4500", text: $urlText)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .keyboardType(.URL)
@@ -22,11 +23,21 @@ struct TerminalView: View {
                 } else {
                     Button("Connect") {
                         let url = urlText.trimmingCharacters(in: .whitespacesAndNewlines)
-                        client.connect(urlString: url)
+                        let key = authKeyText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        client.connect(urlString: url, authKey: key)
                     }
-                    .disabled(urlText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(
+                        urlText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || authKeyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    )
                 }
             }
+
+            TextField("Tailscale auth key (tskey-...)", text: $authKeyText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .textFieldStyle(.roundedBorder)
+                .disabled(client.connectionState != .disconnected)
 
             ScrollView {
                 Text(client.transcript)
@@ -62,6 +73,16 @@ struct TerminalView: View {
             if urlText.isEmpty {
                 urlText = client.lastURL ?? ""
             }
+            if authKeyText.isEmpty {
+                authKeyText = (try? Keychain.getString(account: "tailscale_auth_key")) ?? ""
+            }
+        }
+        .onChange(of: authKeyText) { _, newValue in
+            let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                return
+            }
+            try? Keychain.setString(trimmed, account: "tailscale_auth_key")
         }
         .confirmationDialog(
             "Approval Required",

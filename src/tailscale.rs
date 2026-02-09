@@ -65,11 +65,21 @@ pub async fn best_effort_connect_hint(tailscale_bin: &Path, port: u16) -> Option
     }
 
     let status: StatusJson = serde_json::from_slice(&output.stdout).ok()?;
+
+    if let Some(ip) = status
+        .self_node
+        .tailscale_ips
+        .as_ref()
+        .and_then(|ips| ips.iter().find(|ip| ip.starts_with("100.")))
+    {
+        return Some(format!("http://{ip}:{port}"));
+    }
+
     let mut dns_name = status.self_node.dns_name?;
     if let Some(stripped) = dns_name.strip_suffix('.') {
         dns_name = stripped.to_string();
     }
-    Some(format!("ws://{dns_name}:{port}"))
+    Some(format!("http://{dns_name}:{port}"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,4 +92,7 @@ struct StatusJson {
 struct SelfNode {
     #[serde(rename = "DNSName")]
     dns_name: Option<String>,
+
+    #[serde(rename = "TailscaleIPs")]
+    tailscale_ips: Option<Vec<String>>,
 }
