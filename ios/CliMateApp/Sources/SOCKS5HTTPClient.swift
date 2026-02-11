@@ -13,22 +13,45 @@ enum SOCKS5Error: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .invalidPort(let p):
+        case let .invalidPort(p):
             "Invalid port: \(p)"
         case .connectTimeout:
             "Timed out connecting to proxy"
-        case .proxyHandshakeFailed(let detail):
+        case let .proxyHandshakeFailed(detail):
             "SOCKS5 handshake failed: \(detail)"
         case .proxyAuthFailed:
             "SOCKS5 proxy authentication failed"
-        case .proxyConnectFailed(let rep):
-            "SOCKS5 CONNECT failed (rep=\(rep))"
+        case let .proxyConnectFailed(rep):
+            "SOCKS5 CONNECT failed (rep=\(rep): \(Self.describeSOCKS5Rep(rep)))"
         case .invalidHTTPResponse:
             "Invalid HTTP response"
-        case .httpStatus(let code, let body):
+        case let .httpStatus(code, body):
             "HTTP \(code): \(body)"
-        case .unsupportedURL(let url):
+        case let .unsupportedURL(url):
             "Unsupported URL: \(url)"
+        }
+    }
+
+    private static func describeSOCKS5Rep(_ rep: UInt8) -> String {
+        switch rep {
+        case 0x01:
+            return "general SOCKS server failure"
+        case 0x02:
+            return "connection not allowed by ruleset"
+        case 0x03:
+            return "network unreachable"
+        case 0x04:
+            return "host unreachable"
+        case 0x05:
+            return "connection refused"
+        case 0x06:
+            return "TTL expired"
+        case 0x07:
+            return "command not supported"
+        case 0x08:
+            return "address type not supported"
+        default:
+            return "unknown"
         }
     }
 }
@@ -49,29 +72,33 @@ actor SOCKS5HTTPClient {
         guard let port = NWEndpoint.Port(rawValue: UInt16(proxy.port)) else {
             throw SOCKS5Error.invalidPort(proxy.port)
         }
-        self.proxyHost = NWEndpoint.Host(proxy.host)
-        self.proxyPort = port
-        self.proxyUsername = proxy.username
-        self.proxyPassword = proxy.password
+        proxyHost = NWEndpoint.Host(proxy.host)
+        proxyPort = port
+        proxyUsername = proxy.username
+        proxyPassword = proxy.password
         self.target = target
     }
 
     func get(path: String) async throws -> Data {
+        AppLog.debug("GET \(path)", category: "http")
         let request = buildRequest(method: "GET", path: path, headers: [:], body: nil)
         let (status, _, body) = try await sendOneShotHTTP(request)
         guard status == 200 else {
+            AppLog.warn("GET \(path) -> \(status)", category: "http")
             throw SOCKS5Error.httpStatus(status, String(data: body, encoding: .utf8) ?? "<non-utf8>")
         }
         return body
     }
 
     func postJSON(path: String, jsonBody: Data) async throws -> Data {
+        AppLog.debug("POST \(path)", category: "http")
         let headers = [
             "Content-Type": "application/json",
         ]
         let request = buildRequest(method: "POST", path: path, headers: headers, body: jsonBody)
         let (status, _, body) = try await sendOneShotHTTP(request)
         guard status == 200 else {
+            AppLog.warn("POST \(path) -> \(status)", category: "http")
             throw SOCKS5Error.httpStatus(status, String(data: body, encoding: .utf8) ?? "<non-utf8>")
         }
         return body
@@ -81,6 +108,7 @@ actor SOCKS5HTTPClient {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
+                    AppLog.info("SSE connect \(path)", category: "http")
                     let connection = try await openTunneledConnection()
                     defer { connection.cancel() }
 
@@ -101,7 +129,7 @@ actor SOCKS5HTTPClient {
                     while true {
                         try Task.checkCancellation()
                         if let headerEnd = buffer.range(of: Data("\r\n\r\n".utf8)) {
-                            let headersData = buffer.subdata(in: buffer.startIndex..<headerEnd.lowerBound)
+                            let headersData = buffer.subdata(in: buffer.startIndex ..< headerEnd.lowerBound)
                             let rest = buffer.suffix(from: headerEnd.upperBound)
                             buffer = Data(rest)
 
@@ -110,6 +138,7 @@ actor SOCKS5HTTPClient {
                             }
                             let status = parseHTTPStatus(headerText)
                             if status != 200 {
+                                AppLog.warn("SSE \(path) -> \(status)", category: "http")
                                 throw SOCKS5Error.httpStatus(status, headerText)
                             }
                             break
@@ -203,7 +232,7 @@ actor SOCKS5HTTPClient {
             throw SOCKS5Error.invalidHTTPResponse
         }
 
-        let headersData = buffer.subdata(in: buffer.startIndex..<headerEnd.lowerBound)
+        let headersData = buffer.subdata(in: buffer.startIndex ..< headerEnd.lowerBound)
         let bodyData = buffer.suffix(from: headerEnd.upperBound)
         guard let headerText = String(data: headersData, encoding: .utf8) else {
             throw SOCKS5Error.invalidHTTPResponse
@@ -244,26 +273,38 @@ actor SOCKS5HTTPClient {
     // MARK: - SOCKS5
 
     private func openTunneledConnection() async throws -> NWConnection {
+        AppLog.debug("connect proxy \(proxyHost):\(proxyPort) -> \(target.host):\(target.port)", category: "socks5")
         let connection = NWConnection(host: proxyHost, port: proxyPort, using: .tcp)
+        let queue = DispatchQueue(label: "ai.umate.climate.socks5.connection")
+
+        final class ResumeOnce {
+            private let lock = NSLock()
+            private var didResume = false
+
+            func run(_ block: () -> Void) {
+                lock.lock()
+                defer { lock.unlock() }
+                guard !didResume else { return }
+                didResume = true
+                block()
+            }
+        }
+        let resumeOnce = ResumeOnce()
 
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            var finished = false
-
             connection.stateUpdateHandler = { state in
-                if finished { return }
                 switch state {
                 case .ready:
-                    finished = true
-                    cont.resume()
-                case .failed(let err):
-                    finished = true
-                    cont.resume(throwing: err)
+                    resumeOnce.run { cont.resume() }
+                case let .failed(err):
+                    resumeOnce.run { cont.resume(throwing: err) }
                 default:
                     break
                 }
             }
 
-            connection.start(queue: .global())
+            // Use a dedicated serial queue so state updates don't race the continuation guard.
+            connection.start(queue: queue)
         }
 
         do {
@@ -320,8 +361,8 @@ actor SOCKS5HTTPClient {
 
         var req = Data([0x05, 0x01, 0x00]) // VER, CMD=CONNECT, RSV
         req.append(encodeAddress(host))
-        req.append(UInt8((port >> 8) & 0xff))
-        req.append(UInt8(port & 0xff))
+        req.append(UInt8((port >> 8) & 0xFF))
+        req.append(UInt8(port & 0xFF))
 
         try await connection.sendData(req)
 
@@ -416,12 +457,12 @@ private struct LineBuffer {
     }
 
     mutating func popLine() -> String? {
-        guard let range = buf.firstRange(of: Data([0x0a])) else { // \n
+        guard let range = buf.firstRange(of: Data([0x0A])) else { // \n
             return nil
         }
-        let lineData = buf.subdata(in: buf.startIndex..<range.lowerBound)
-        buf.removeSubrange(buf.startIndex..<range.upperBound)
-        let trimmed = lineData.last == 0x0d ? lineData.dropLast() : lineData[...]
+        let lineData = buf.subdata(in: buf.startIndex ..< range.lowerBound)
+        buf.removeSubrange(buf.startIndex ..< range.upperBound)
+        let trimmed = lineData.last == 0x0D ? lineData.dropLast() : lineData[...]
         return String(data: Data(trimmed), encoding: .utf8)
     }
 }

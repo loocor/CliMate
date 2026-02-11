@@ -8,6 +8,11 @@ struct PendingApproval: Identifiable {
 
 @MainActor
 final class CodexClient: ObservableObject {
+    enum ConnectMode {
+        case manual
+        case auto
+    }
+
     enum ConnectionState {
         case disconnected
         case connecting
@@ -19,9 +24,22 @@ final class CodexClient: ObservableObject {
     @Published var pendingApproval: PendingApproval?
     @Published var lastError: String?
 
-    private(set) var lastURL: String? = nil
+    private static let maxTranscriptCharacters: Int = 200_000
+
+    enum SSEPayloadKindForTests: Equatable {
+        case serverRequest
+        case response
+        case transcriptDelta
+        case transcriptBoundary
+        case transcriptError
+        case ignore
+    }
+
+    private(set) var lastURL: String?
 
     private var eventsTask: Task<Void, Never>?
+    private var retryTask: Task<Void, Never>?
+    private var retryAttempt: Int = 0
 
     private var baseURL: URL?
     private var httpClient: SOCKS5HTTPClient?
@@ -31,30 +49,36 @@ final class CodexClient: ObservableObject {
 
     private var threadId: String?
 
-    func connect(urlString: String, authKey: String) {
+    func connect(urlString: String, mode: ConnectMode = .manual) {
         if connectionState != .disconnected {
             return
         }
 
+        if mode == .manual {
+            retryTask?.cancel()
+            retryTask = nil
+            retryAttempt = 0
+        }
+
         guard let baseURL = URL(string: urlString) else {
-            lastError = "Invalid URL"
+            if mode == .manual {
+                lastError = "Invalid URL"
+            }
             return
         }
         if baseURL.scheme?.lowercased() != "http" {
-            lastError = "Only http:// is supported (server is HTTP + SSE)."
+            if mode == .manual {
+                lastError = "Only http:// is supported (server is HTTP + SSE)."
+            }
             return
         }
         guard let host = baseURL.host else {
-            lastError = "Invalid URL (missing host)"
+            if mode == .manual {
+                lastError = "Invalid URL (missing host)"
+            }
             return
         }
         let port = baseURL.port ?? 80
-
-        let trimmedAuthKey = authKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmedAuthKey.isEmpty {
-            lastError = "Missing Tailscale auth key"
-            return
-        }
 
         lastURL = urlString
         connectionState = .connecting
@@ -66,14 +90,18 @@ final class CodexClient: ObservableObject {
 
         Task {
             do {
-                let proxy = try await EmbeddedTailscale.shared.proxyConfig(authKey: trimmedAuthKey)
+                let proxy = try await EmbeddedTailscale.shared.proxyConfig()
                 self.appendLine("[tailscale] proxy \(proxy.debugDescription)")
+                let resolvedHost = await EmbeddedTailscale.shared.bestEffortResolveTargetHost(host)
                 self.appendLine("[tailscale] target http://\(host):\(port)")
+                if resolvedHost != host {
+                    self.appendLine("[tailscale] resolved target http://\(resolvedHost):\(port)")
+                }
 
                 do {
                     let client = try SOCKS5HTTPClient(
                         proxy: proxy,
-                        target: .init(host: host, port: port)
+                        target: .init(host: resolvedHost, port: port)
                     )
                     self.httpClient = client
 
@@ -86,24 +114,43 @@ final class CodexClient: ObservableObject {
 
                 self.log("starting SSE /events")
 
-                self.eventsTask = Task { [weak self] in
-                    await self?.eventsLoop()
+                guard let sseClient = self.httpClient else {
+                    throw ClientError.notConnected
                 }
+                self.eventsTask = self.startEventsLoop(httpClient: sseClient)
 
-                do {
-                    try await self.initializeHandshake()
-                    try await self.startThread()
-                    self.appendLine("[connected]")
-                    self.connectionState = .connected
-                    self.log("connected")
-                } catch {
-                    self.log("connect failed: \(error)")
-                    self.lastError = Self.describe(error)
-                    self.disconnect()
+                try await self.initializeHandshake()
+                try await self.startThread()
+                self.appendLine("[connected]")
+                self.connectionState = .connected
+                self.log("connected")
+                self.retryTask?.cancel()
+                self.retryTask = nil
+                self.retryAttempt = 0
+            } catch EmbeddedTailscaleError.needsLogin(let urlString) {
+                self.log("tailscale needs login: \(urlString)")
+                if mode == .manual {
+                    self.lastError = "Sign-in required. Open Settings → Servers and sign in."
+                } else {
+                    self.appendLine("[tailscale] sign-in required (Settings → Servers)")
                 }
+                self.disconnect()
+            } catch EmbeddedTailscaleError.backendNotReady(let message) {
+                self.log("tailscale backend not ready: \(message)")
+                if mode == .manual {
+                    self.lastError = "Network is starting. Try again in a moment."
+                } else {
+                    self.appendLine("[tailscale] network starting; will retry")
+                    self.scheduleRetry(urlString: urlString)
+                }
+                self.disconnect(cancelRetryTask: mode == .manual, resetRetryAttempt: mode == .manual)
             } catch {
-                self.log("tailscale init failed: \(error)")
-                self.lastError = Self.describe(error)
+                self.log("connect failed: \(error)")
+                if mode == .manual {
+                    self.lastError = Self.describe(error)
+                } else {
+                    self.appendLine("[error] \(Self.describe(error))")
+                }
                 self.disconnect()
             }
         }
@@ -114,17 +161,41 @@ final class CodexClient: ObservableObject {
         _ = try await client.get(path: "/healthz")
     }
 
-    func disconnect() {
+    func disconnect(cancelRetryTask: Bool = true, resetRetryAttempt: Bool = true) {
         log("disconnect")
         eventsTask?.cancel()
         eventsTask = nil
+        if cancelRetryTask {
+            retryTask?.cancel()
+            retryTask = nil
+        }
+        if resetRetryAttempt {
+            retryAttempt = 0
+        }
         baseURL = nil
         httpClient = nil
 
+        let pending = Array(pendingResponses.values)
         pendingResponses.removeAll()
+        for cont in pending {
+            cont.resume(throwing: ClientError.notConnected)
+        }
         pendingApproval = nil
         threadId = nil
         connectionState = .disconnected
+    }
+
+    private func scheduleRetry(urlString: String) {
+        retryTask?.cancel()
+        retryTask = nil
+        retryAttempt += 1
+        let delay = Self.retryDelaySecondsForTests(attempt: retryAttempt)
+        retryTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            await MainActor.run { [weak self] in
+                self?.connect(urlString: urlString, mode: .auto)
+            }
+        }
     }
 
     func sendUserText(_ text: String) {
@@ -143,7 +214,7 @@ final class CodexClient: ObservableObject {
                 "type": "text",
                 "text": text,
                 "textElements": [],
-            ]
+            ],
         ]
 
         let params: [String: Any] = [
@@ -187,8 +258,14 @@ final class CodexClient: ObservableObject {
             ],
         ]
 
-        _ = try await request(method: "initialize", params: params)
-        _ = try await postRPC(["method": "initialized", "params": [:]])
+        do {
+            _ = try await request(method: "initialize", params: params)
+            _ = try await postRPC(["method": "initialized", "params": [:]])
+        } catch let ClientError.remoteError(message) where message.contains("Already initialized") {
+            // Reconnects may hit an existing per-client codex process. In that case,
+            // "initialize" is expected to be rejected and should be treated as success.
+            log("initialize skipped: already initialized")
+        }
     }
 
     private func startThread() async throws {
@@ -220,8 +297,9 @@ final class CodexClient: ObservableObject {
                 do {
                     _ = try await postRPC(payload)
                 } catch {
-                    pendingResponses.removeValue(forKey: id)
-                    cont.resume(throwing: error)
+                    if pendingResponses.removeValue(forKey: id) != nil {
+                        cont.resume(throwing: error)
+                    }
                 }
             }
         }
@@ -244,44 +322,8 @@ final class CodexClient: ObservableObject {
         return obj
     }
 
-    private func eventsLoop() async {
-        do {
-            guard let client = httpClient else { return }
-            var currentData: String?
-            let stream = await client.sse(path: "/events")
-            for try await line in stream {
-                if Task.isCancelled { break }
-
-                if line.isEmpty {
-                    if let data = currentData {
-                        handleIncoming(text: data)
-                    }
-                    currentData = nil
-                    continue
-                }
-
-                if line.hasPrefix(":") {
-                    // SSE comment/keepalive.
-                    continue
-                }
-
-                if line.hasPrefix("data:") {
-                    let value = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
-                    currentData = value
-                }
-            }
-
-            log("SSE ended")
-        } catch {
-            log("SSE failed: \(error)")
-            if connectionState == .connected || connectionState == .connecting {
-                lastError = Self.describe(error)
-            }
-            disconnect()
-        }
-    }
-
-    private func log(_ message: String) {
+    private func log(_ message: String, level: AppLogLevel = .info) {
+        AppLog.post(level: level, category: "codex", message: message)
         NSLog("[climate] %@", message)
     }
 
@@ -297,23 +339,194 @@ final class CodexClient: ObservableObject {
         return parts.joined(separator: " ")
     }
 
-    private func handleIncoming(text: String) {
-        guard let data = text.data(using: .utf8) else { return }
-        guard let json = try? JSONSerialization.jsonObject(with: data, options: []) else { return }
-        guard let obj = json as? [String: Any] else { return }
+
+    private func startEventsLoop(httpClient: SOCKS5HTTPClient) -> Task<Void, Never> {
+        Task.detached(priority: .utility) { [weak self] in
+            await self?.eventsLoopBackground(httpClient: httpClient)
+        }
+    }
+
+    private nonisolated func eventsLoopBackground(httpClient: SOCKS5HTTPClient) async {
+        do {
+            var currentData: String?
+            var pendingTranscript: String = ""
+            var lastFlushAt = Date()
+
+            func flushTranscript(force: Bool = false) async {
+                if pendingTranscript.isEmpty {
+                    return
+                }
+                let now = Date()
+                if !force, pendingTranscript.count < 2048, now.timeIntervalSince(lastFlushAt) < 0.06 {
+                    return
+                }
+
+                let chunk = pendingTranscript
+                pendingTranscript = ""
+                lastFlushAt = now
+                await MainActor.run { [weak self] in
+                    self?.appendToTranscript(chunk)
+                }
+            }
+
+            let stream = await httpClient.sse(path: "/events")
+            for try await line in stream {
+                if Task.isCancelled {
+                    break
+                }
+
+                if line.isEmpty {
+                    if let data = currentData {
+                        switch Self.parseSSEPayload(data) {
+                        case let .serverRequest(id, method, params):
+                            await flushTranscript(force: true)
+                            await MainActor.run { [weak self] in
+                                self?.handleServerRequest(id: id, method: method, params: params)
+                            }
+                        case let .response(id, result, error):
+                            await flushTranscript(force: true)
+                            await MainActor.run { [weak self] in
+                                self?.handleResponse(id: id, result: result, error: error)
+                            }
+                        case let .transcriptDelta(delta):
+                            pendingTranscript.append(delta)
+                        case .transcriptBoundary:
+                            pendingTranscript.append("\n\n")
+                        case let .transcriptError(message):
+                            pendingTranscript.append("[error] \(message)\n")
+                        case .ignore:
+                            break
+                        }
+                    }
+                    currentData = nil
+                    await flushTranscript(force: false)
+                    continue
+                }
+
+                if line.hasPrefix(":") {
+                    // SSE comment/keepalive.
+                    continue
+                }
+
+                if line.hasPrefix("data:") {
+                    let value = line.dropFirst(5).trimmingCharacters(in: CharacterSet.whitespaces)
+                    currentData = value
+                }
+
+                await flushTranscript(force: false)
+            }
+
+            if Task.isCancelled {
+                return
+            }
+            await flushTranscript(force: true)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.log("SSE ended", level: .warn)
+                if self.connectionState != .disconnected {
+                    self.disconnect()
+                }
+            }
+        } catch {
+            if error is CancellationError {
+                return
+            }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.log("SSE failed: \(error)", level: .error)
+                if self.connectionState == .connected || self.connectionState == .connecting {
+                    self.lastError = Self.describe(error)
+                }
+                self.disconnect()
+            }
+        }
+    }
+
+    private enum SSEPayloadAction {
+        case serverRequest(id: Int, method: String, params: Any?)
+        case response(id: Int, result: Any?, error: Any?)
+        case transcriptDelta(String)
+        case transcriptBoundary
+        case transcriptError(String)
+        case ignore
+    }
+
+    private nonisolated static func parseSSEPayload(_ text: String) -> SSEPayloadAction {
+        guard let data = text.data(using: .utf8) else { return .ignore }
+        guard let json = try? JSONSerialization.jsonObject(with: data, options: []) else { return .ignore }
+        guard let obj = json as? [String: Any] else { return .ignore }
 
         if let method = obj["method"] as? String {
-            if let id = parseId(obj["id"]) {
-                handleServerRequest(id: id, method: method, params: obj["params"])
-            } else {
-                handleNotification(method: method, params: obj["params"])
+            if let id = parseIdNonisolated(obj["id"]) {
+                return .serverRequest(id: id, method: method, params: obj["params"])
             }
-            return
+
+            if method == "item/agentMessage/delta" {
+                if let params = obj["params"] as? [String: Any], let delta = params["delta"] as? String {
+                    return .transcriptDelta(delta)
+                }
+                return .ignore
+            }
+
+            if method == "turn/completed" {
+                return .transcriptBoundary
+            }
+
+            if method == "error" {
+                if let params = obj["params"] as? [String: Any], let message = params["message"] as? String {
+                    return .transcriptError(message)
+                }
+                return .ignore
+            }
+
+            return .ignore
         }
 
-        if let id = parseId(obj["id"]) {
-            handleResponse(id: id, result: obj["result"], error: obj["error"])
+        if let id = parseIdNonisolated(obj["id"]) {
+            return .response(id: id, result: obj["result"], error: obj["error"])
         }
+
+        return .ignore
+    }
+
+    nonisolated static func ssePayloadKindForTests(_ text: String) -> SSEPayloadKindForTests {
+        switch parseSSEPayload(text) {
+        case .serverRequest:
+            return .serverRequest
+        case .response:
+            return .response
+        case .transcriptDelta:
+            return .transcriptDelta
+        case .transcriptBoundary:
+            return .transcriptBoundary
+        case .transcriptError:
+            return .transcriptError
+        case .ignore:
+            return .ignore
+        }
+    }
+
+    nonisolated static func clippedTranscriptForTests(_ text: String, max: Int) -> String {
+        guard max > 0 else { return "" }
+        if text.count <= max {
+            return text
+        }
+        return String(text.suffix(max))
+    }
+
+    nonisolated static func retryDelaySecondsForTests(attempt: Int) -> Double {
+        let normalized = max(1, attempt)
+        return min(pow(1.6, Double(normalized)), 20)
+    }
+
+    @MainActor
+    func setRetryAttemptForTests(_ value: Int) {
+        retryAttempt = value
+    }
+
+    @MainActor
+    func retryAttemptForTests() -> Int {
+        retryAttempt
     }
 
     private func handleResponse(id: Int, result: Any?, error: Any?) {
@@ -411,7 +624,20 @@ final class CodexClient: ObservableObject {
         return parts.joined(separator: "\n")
     }
 
-    private func parseId(_ raw: Any?) -> Int? {
+    private nonisolated func parseId(_ raw: Any?) -> Int? {
+        if let id = raw as? Int {
+            return id
+        }
+        if let id = raw as? Double {
+            return Int(id)
+        }
+        if let id = raw as? String {
+            return Int(id)
+        }
+        return nil
+    }
+
+    private nonisolated static func parseIdNonisolated(_ raw: Any?) -> Int? {
         if let id = raw as? Int {
             return id
         }
@@ -425,11 +651,17 @@ final class CodexClient: ObservableObject {
     }
 
     private func append(_ text: String) {
-        transcript.append(text)
+        appendToTranscript(text)
     }
 
     private func appendLine(_ line: String) {
-        transcript.append("\(line)\n")
+        appendToTranscript("\(line)\n")
+    }
+
+    private func appendToTranscript(_ text: String) {
+        guard !text.isEmpty else { return }
+        transcript.append(text)
+        transcript = Self.clippedTranscriptForTests(transcript, max: Self.maxTranscriptCharacters)
     }
 }
 
@@ -449,11 +681,11 @@ enum ClientError: LocalizedError {
             "Invalid base URL"
         case .serializationFailed:
             "Failed to serialize message"
-        case .httpError(let code, let body):
+        case let .httpError(code, body):
             "HTTP \(code): \(body)"
-        case .remoteError(let message):
+        case let .remoteError(message):
             "Server error: \(message)"
-        case .unexpectedResponse(let detail):
+        case let .unexpectedResponse(detail):
             "Unexpected response: \(detail)"
         }
     }

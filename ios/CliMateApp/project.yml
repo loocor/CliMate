@@ -24,3 +24,16 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.umate.climate.ios
         INFOPLIST_FILE: Resources/Info.plist
+
+  CliMateTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Tests
+    dependencies:
+      - target: CliMate
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.umate.climate.ios.tests
+        GENERATE_INFOPLIST_FILE: YES
