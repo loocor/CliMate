@@ -14,6 +14,7 @@ import (
 
 	"climate/server/internal/codex"
 	"climate/server/internal/httpx"
+	"climate/server/internal/identity"
 	"climate/server/internal/tailnet"
 	"golang.org/x/sync/errgroup"
 )
@@ -31,7 +32,7 @@ func Run(ctx context.Context, cfg Config) error {
 	cfg = normalizeConfig(cfg)
 
 	manager := codex.NewManager(cfg.CodexBin)
-	handler := httpx.NewHandler(manager)
+	localHandler := httpx.NewHandler(manager, identity.Header{HeaderName: "X-Client-ID"})
 
 	localAddr := fmt.Sprintf("%s:%d", cfg.BindIP, cfg.Port)
 	localBase := fmt.Sprintf("http://%s", localAddr)
@@ -68,7 +69,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	log.Printf("Press Ctrl+C to stop.")
 
-	localServer := &http.Server{Handler: handler}
+	localServer := &http.Server{Handler: localHandler}
 	var tailServer *http.Server
 
 	group, groupCtx := errgroup.WithContext(ctx)
@@ -76,7 +77,13 @@ func Run(ctx context.Context, cfg Config) error {
 		return serveHTTP(localServer, localLn)
 	})
 	if tail != nil {
-		tailServer = &http.Server{Handler: handler}
+		var tailIdentity identity.Provider = identity.TSNet{Client: tail.LocalClient}
+		if tail.LocalClient == nil {
+			log.Printf("[warn] tsnet LocalClient unavailable; falling back to header identity")
+			tailIdentity = identity.Header{HeaderName: "X-Client-ID"}
+		}
+		tailHandler := httpx.NewHandler(manager, tailIdentity)
+		tailServer = &http.Server{Handler: tailHandler}
 		group.Go(func() error {
 			return serveHTTP(tailServer, tail.Listener)
 		})

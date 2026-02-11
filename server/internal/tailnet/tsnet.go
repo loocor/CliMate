@@ -7,7 +7,9 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 
+	"tailscale.com/client/local"
 	"tailscale.com/tsnet"
 )
 
@@ -20,6 +22,7 @@ type Config struct {
 
 type Instance struct {
 	Server      *tsnet.Server
+	LocalClient *local.Client
 	Listener    net.Listener
 	ConnectHint string
 }
@@ -52,11 +55,22 @@ func Start(ctx context.Context, cfg Config) (*Instance, error) {
 		return nil, fmt.Errorf("tsnet listen failed: %w", err)
 	}
 
-	return &Instance{
+	localClient, _ := server.LocalClient()
+
+	inst := &Instance{
 		Server:      server,
+		LocalClient: localClient,
 		Listener:    listener,
 		ConnectHint: bestEffortConnectHint(ctx, server, cfg.Port),
-	}, nil
+	}
+
+	// bestEffortConnectHint can be empty during early startup; update it later once
+	// tailscale status is available, to reduce client-side confusion about the URL.
+	if inst.ConnectHint == "" {
+		go inst.updateConnectHint(ctx, cfg.Port)
+	}
+
+	return inst, nil
 }
 
 func (i *Instance) Close() error {
@@ -84,4 +98,43 @@ func bestEffortConnectHint(ctx context.Context, server *tsnet.Server, port int) 
 		return ""
 	}
 	return fmt.Sprintf("http://%s:%d", name, port)
+}
+
+func (i *Instance) updateConnectHint(ctx context.Context, port int) {
+	if i == nil || i.LocalClient == nil {
+		return
+	}
+
+	deadline := time.NewTimer(30 * time.Second)
+	defer deadline.Stop()
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-deadline.C:
+			return
+		case <-ticker.C:
+			status, err := i.LocalClient.Status(ctx)
+			if err != nil || status == nil || status.Self == nil {
+				continue
+			}
+
+			name := strings.TrimSuffix(status.Self.DNSName, ".")
+			if name == "" && status.Self.HostName != "" && status.MagicDNSSuffix != "" {
+				name = status.Self.HostName + "." + status.MagicDNSSuffix
+			}
+			if name == "" {
+				continue
+			}
+
+			hint := fmt.Sprintf("http://%s:%d", name, port)
+			i.ConnectHint = hint
+			log.Printf("[tsnet] connect hint: %s", hint)
+			return
+		}
+	}
 }
